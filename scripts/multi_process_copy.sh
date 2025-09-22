@@ -1,0 +1,2 @@
+mkdir -p /mnt/algo-fastnas/ming_gao/data/latents/
+find /mnt/teams/algo-teams/ming.gao/latent/spatialvidHQ_vae_latent_5s -type f -print0 | xargs -0 -n1 -P8 -I{} rsync -aR {} /mnt/algo-fastnas/ming_gao/data/latents/
