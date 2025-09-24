@@ -30,7 +30,13 @@ import multiprocessing as mp
 from queue import Empty as QueueEmpty
 import faiss
 import faiss.contrib.torch_utils
+from tqdm import tqdm
 from collections import OrderedDict
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
+
 try:
     import wandb
     WANDB_OK = True
@@ -62,6 +68,161 @@ def log0(*a):
 # -----------------------------
 # File loader: .pt dict -> [N,16] numpy (float32)
 # -----------------------------
+
+from torch.utils.data import IterableDataset, DataLoader, get_worker_info
+
+class LatentIterable(IterableDataset):
+    def __init__(self, files, latent_key="latents", layout="cthw",
+                 subsample=(3,3,5), target_batch=200000, cache_max_gb: float = 8.0):
+        super().__init__()
+        self.files = sorted(files)
+        self.latent_key = latent_key
+        self.layout = layout
+        self.subsample = subsample
+        self.target_batch = target_batch
+        self.cache_max_bytes = int(cache_max_gb * (1024**3))
+        self._cache = None     # OrderedDict[path -> np.ndarray]
+        self._cache_bytes = 0
+    def _rank_shard(self, files):
+        if dist.is_initialized():
+            world = dist.get_world_size()
+            rank = dist.get_rank()
+            files = [f for i,f in enumerate(files) if i % world == rank]
+        return files
+
+    def _worker_shard(self, files):
+        info = get_worker_info()
+        if info is None or info.num_workers <= 1:
+            return files
+        wid, nw = info.id, info.num_workers
+        return [f for i, f in enumerate(files) if i % nw == wid]
+
+    def _cache_get(self, path):
+        if self._cache is None or self.cache_max_bytes <= 0:
+            return None
+        arr = self._cache.get(path)
+        if arr is not None:
+            # LRU：刷新到队尾
+            self._cache.move_to_end(path)
+        return arr
+
+    def _cache_put(self, path, arr: np.ndarray):
+        if self.cache_max_bytes <= 0:
+            return
+        if self._cache is None:
+            self._cache = OrderedDict()
+            self._cache_bytes = 0
+        size = int(arr.nbytes)
+        if size > self.cache_max_bytes:
+            return
+        # 淘汰到放得下为止
+        while (self._cache_bytes + size) > self.cache_max_bytes and len(self._cache) > 0:
+            _, old = self._cache.popitem(last=False)  # LRU pop
+            self._cache_bytes -= int(old.nbytes)
+        self._cache[path] = arr
+        self._cache_bytes += size
+    
+    
+    def count_tokens_precise(self):
+        """精确统计本 rank 的 token 数（按当前 latent_key/layout/subsample/skip_first_frame）"""
+        files = self._rank_shard(self.files)
+        total = 0
+        bad = 0
+        for f in files:
+            try:
+                arr = self._cache_get(f)
+                if arr is None:
+                    arr = pt_to_numpy(f, self.latent_key, self.layout, self.subsample)  # np.float32 [N,16]
+                    # 保证只读，避免下游意外 in-place 修改污染缓存
+                    arr.setflags(write=False)
+                    self._cache_put(f, arr)
+            except Exception as e:
+                bad += 1
+                print(f"[count] skip {f}: {e}", flush=True)
+                continue
+        self._tokens_total = total
+        self._files_total = len(files) - bad
+        self._batches_total = (total + self.target_batch - 1) // self.target_batch
+        return self._tokens_total, self._batches_total, self._files_total
+    
+    
+    def __iter__(self):
+        files = self._rank_shard(self.files)
+        files = self._worker_shard(files)
+
+        buf, buf_n = [], 0
+        subsample = self.subsample  # (st,sh,sw) or None
+
+        for f in files:
+            
+            try:
+                arr = self._cache_get(f)
+                if arr is None:
+                    arr = pt_to_numpy(f, self.latent_key, self.layout, subsample)  # np.float32 [N,16]
+                    # 保证只读，避免下游意外 in-place 修改污染缓存
+                    arr.setflags(write=False)
+                    self._cache_put(f, arr)
+            except Exception as e:
+                print(f"[dataset] error {f}: {e}", flush=True)
+                continue
+
+            buf.append(arr); buf_n += arr.shape[0]
+            while buf_n >= self.target_batch:
+                need, take = self.target_batch, []
+                while need > 0:
+                    a = buf[0]
+                    if a.shape[0] <= need:
+                        take.append(a); need -= a.shape[0]; buf.pop(0); buf_n -= a.shape[0]
+                    else:
+                        take.append(a[:need]); buf[0] = a[need:]; buf_n -= need; need = 0
+                big = np.concatenate(take, axis=0, dtype=np.float32, casting='no')
+                yield torch.from_numpy(big)  # CPU tensor；DataLoader 会 pin_memory
+
+        if buf_n > 0:
+            big = np.concatenate(buf, axis=0, dtype=np.float32, casting='no')
+            yield torch.from_numpy(big)
+            
+            
+def make_loader(files,
+                latent_key="latents",
+                layout="cthw",
+                subsample=None,
+                batch_size=200000,
+                loader_workers=8,
+                prefetch=4):
+    ds = LatentIterable(files,
+                        latent_key=latent_key,
+                        layout=layout,
+                        subsample=subsample,
+                        target_batch=batch_size,
+                        cache_max_gb=8.0)
+    loader = DataLoader(
+        ds,
+        batch_size=None,
+        num_workers=loader_workers,
+        pin_memory=True,
+        prefetch_factor=prefetch,
+        persistent_workers=True,
+        multiprocessing_context="spawn",
+    )
+    return loader
+
+
+def count_tokens(files, latent_key, layout, subsample, world_size, rank):
+    shard_files = [f for i, f in enumerate(sorted(files)) if i % world_size == rank]
+    total = 0
+    idx = 0
+    for f in shard_files:
+        try:
+            arr = pt_to_numpy(f, latent_key, layout, subsample)  # np [N,16]
+        except Exception as e:
+            print(f"[count_tokens] skip {f}: {e}")
+            continue
+        total += arr.shape[0]
+        idx += 1
+        if idx % 100 == 0:
+            print(f"[rank{rank}] total files so far: {idx}", flush=True)
+    return total
 
 def pt_to_numpy(path: str, latent_key: str, layout: str, subsample: Tuple[int,int,int] | None):
     obj = torch.load(path, map_location="cpu")
@@ -110,53 +271,7 @@ def pt_to_numpy(path: str, latent_key: str, layout: str, subsample: Tuple[int,in
 
     return x.numpy()  # float32 numpy [N,16]
 
-# -----------------------------
-# Iterator over batches across many small .pt files (sharded by rank)
-# -----------------------------
-def iter_batches(files, batch_size, device, dtype, latent_key, layout, subsample):
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
-    shard_files = [f for i,f in enumerate(sorted(files)) if i % world_size == rank]
-    if rank == 0:
-        print(f"[rank0] files assigned: {len(shard_files)}, batch_size={batch_size}", flush=True)
 
-    gpu_dtype = dtype
-    buf = []                 # 累计多个文件
-    buf_n = 0
-    iterator = tqdm(shard_files, desc="rank0: loading .pt", dynamic_ncols=True) if (rank==0 and _HAS_TQDM) else shard_files
-
-    for i, f in enumerate(iterator):
-        arr = pt_to_numpy(f, latent_key, layout, subsample)  # numpy float32 [N,16]
-        buf.append(arr); buf_n += arr.shape[0]
-
-        # 跨文件拼到 >= batch_size 再上 GPU
-        while buf_n >= batch_size:
-            need = batch_size
-            take = []
-            while need > 0:
-                a = buf[0]
-                if a.shape[0] <= need:
-                    take.append(a); need -= a.shape[0]; buf.pop(0)
-                else:
-                    take.append(a[:need]); buf[0] = a[need:]; need = 0
-            xb = np.concatenate(take, axis=0, dtype=np.float32, casting='no')
-            xb = torch.from_numpy(xb).to(device=device, dtype=gpu_dtype, non_blocking=True)
-            yield xb
-            del xb
-
-            buf_n = sum(x.shape[0] for x in buf)
-            torch.cuda.empty_cache()
-
-        if rank != 0 and (i % 200 == 0):
-            print(f"[rank{rank}] processed {i}/{len(shard_files)} files", flush=True)
-
-    # flush 余量
-    if buf_n > 0:
-        xb = np.concatenate(buf, axis=0, dtype=np.float32, casting='no')
-        xb = torch.from_numpy(xb).to(device=device, dtype=gpu_dtype, non_blocking=True)
-        yield xb
-        del xb
-    torch.cuda.empty_cache()
 
 # -----------------------------
 # Whitening stats (μ, Σ)
@@ -167,7 +282,12 @@ def dist_mean_cov(files, batch_size, device, dtype, latent_key, layout, subsampl
     n_local = 0
     s1 = torch.zeros(d, device=device, dtype=torch.float64)
     s2 = torch.zeros(d, d, device=device, dtype=torch.float64)
-    for xb in iter_batches(files, batch_size, device, dtype, latent_key, layout, subsample):
+    
+    
+    loader = make_loader(files, batch_size=batch_size)
+    
+    
+    for xb in loader:
         x = xb.to(torch.float32)
         n_local += x.shape[0]
         s1 += x.sum(0, dtype=torch.float64)
@@ -209,7 +329,8 @@ def init_centers_kmeanspp(files, args, device, dtype, W, mu):
     per_rank = max(1, args.init_samples // dist.get_world_size())
     got = 0
     bufs = []
-    for xb in iter_batches(files, args.batch_size, device, dtype, args.latent_key, args.layout, args.subsample):
+    loader = make_loader(files, subsample=args.subsample, batch_size=min(args.batch_size, per_rank))
+    for xb in loader:
         x = xb.to(torch.float32)
         if args.whitening != "none":
             x = (x - mu) @ W.t()
@@ -279,10 +400,31 @@ def one_iter(files, args, device, centers, W, mu):
     sse_local = torch.zeros(1, device=device, dtype=torch.float64)
 
     index = build_index_gpu(centers, args.index_type, args.nlist, args.nprobe)
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
 
-    files_sorted = sorted(files)
-    for xb in iter_batches(files_sorted, args.batch_size, device, torch.bfloat16 if args.use_bf16 else torch.float16, args.latent_key, args.layout, args.subsample):
-        x = xb.to(torch.float32)
+    
+    #n_tokens_local = count_tokens(files, args.latent_key, args.layout, args.subsample, world_size, rank)
+    #n_batches_rank = (n_tokens_local + args.batch_size - 1) // args.batch_size
+    #print(f"[rank{rank}] tokens={n_tokens_local}, batches={n_batches_rank}")
+    
+    loader = make_loader(files, subsample=args.subsample, batch_size=args.batch_size)
+    total_batches = 0
+    for _ in loader:
+        total_batches += 1
+        if total_batches % 100 == 0:
+            print(f"[rank{rank}] prepared {total_batches} batches", flush=True)
+        
+    if rank == 0:
+        pbar = tqdm(loader, total=total_batches,
+                    desc=f"iter progress (rank0)", dynamic_ncols=True)
+    else:
+        pbar = loader   # 其他 rank 不要 tqdm，省日志
+    
+    #loader = make_loader(files, batch_size=args.batch_size)
+    #files_sorted = sorted(files)
+    for xb in pbar:
+        x = xb.to(device=device, dtype=torch.float32, non_blocking=True)
         if args.whitening != "none":
             x = (x - mu) @ W.t()
         D, I = index.search(x, 1)
@@ -299,6 +441,7 @@ def one_iter(files, args, device, centers, W, mu):
 
         del xb, x, D, I, labels, uniq, inv, sums, cnts
         torch.cuda.empty_cache()
+       
 
     dist.all_reduce(sum_local, op=dist.ReduceOp.SUM)
     dist.all_reduce(cnt_local, op=dist.ReduceOp.SUM)
@@ -336,6 +479,8 @@ def main():
     ap.add_argument("--resume_centers", type=str, default="")
     ap.add_argument("--wandb_project", type=str, default="")
     ap.add_argument("--wandb_run", type=str, default="")
+    ap.add_argument("--loader_workers", type=int, default=8)
+    ap.add_argument("--prefetch", type=int, default=4)
     args = ap.parse_args()
 
     setup_dist()
